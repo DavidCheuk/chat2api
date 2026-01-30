@@ -149,7 +149,7 @@ class ChatService:
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-origin',
             # Chrome 144 Client Hints (CRITICAL - all 9 required)
-            'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144"',
+            'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="124"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"macOS"',
             'sec-ch-ua-arch': '""',
