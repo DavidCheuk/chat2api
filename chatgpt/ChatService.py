@@ -185,13 +185,21 @@ class ChatService:
             self.base_headers['authkey'] = auth_key
 
         # M6: Initialize OAI state cookies (normally set by client-side JS)
-        oai_device_id = self.base_headers.get('oai-device-id', str(uuid.uuid4()))
         self._oai_state_cookies = {
             'oai-hm': '0',  # Help menu state
             'oai-hlib': '0',  # Help library state
             'oai-asli': '0',  # Assistive library state
         }
-        # Append OAI state cookies to existing Cookie header
+
+        # L2: g_state cookie (Google ITP optimization)
+        g_state_val = json.dumps({"i_l": 0, "i_t": int(time.time())})
+        self._oai_state_cookies['g_state'] = g_state_val
+
+        # L3: _dd_s cookie (DataDog session tracking)
+        dd_session_id = uuid.uuid4().hex
+        self._oai_state_cookies['_dd_s'] = f'rum=0&expire={int(time.time()) + 900}&id={dd_session_id}'
+
+        # Append all state cookies to existing Cookie header
         existing_cookies = self.base_headers.get('Cookie', '')
         state_cookie_str = '; '.join(f'{k}={v}' for k, v in self._oai_state_cookies.items())
         if existing_cookies:
