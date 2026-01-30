@@ -4,7 +4,7 @@ from curl_cffi.requests import AsyncSession
 
 
 class Client:
-    def __init__(self, proxy=None, timeout=15, verify=True, impersonate='safari15_3'):
+    def __init__(self, proxy=None, timeout=15, verify=True, impersonate='chrome124'):
         self.proxies = {"http": proxy, "https": proxy}
         self.timeout = timeout
         self.verify = verify

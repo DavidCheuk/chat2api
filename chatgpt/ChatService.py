@@ -13,7 +13,7 @@ from chatgpt.authorization import get_req_token, verify_token
 from chatgpt.chatFormat import api_messages_to_chat, stream_response, format_not_stream_response, head_process_response
 from chatgpt.chatLimit import check_is_limit, handle_request_limit
 from chatgpt.fp import get_fp
-from chatgpt.proofofWork import get_config, get_dpl, get_answer_token, get_requirements_token
+from chatgpt.proofofWork import get_config, get_dpl, get_answer_token, get_requirements_token, cached_dpl, cached_build_number
 
 from utils.Client import Client
 from utils.Logger import logger
@@ -115,15 +115,37 @@ class ChatService:
             'referer': f'{self.host_url}/',
             'sec-fetch-dest': 'empty',
             'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-origin'
+            'sec-fetch-site': 'same-origin',
+            # Chrome 144 Client Hints (CRITICAL - all 9 required)
+            'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="124"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"macOS"',
+            'sec-ch-ua-arch': '""',
+            'sec-ch-ua-bitness': '""',
+            'sec-ch-ua-full-version': '""',
+            'sec-ch-ua-full-version-list': '',
+            'sec-ch-ua-model': '""',
+            'sec-ch-ua-platform-version': '""',
         }
         self.base_headers.update(self.fp)
 
+        # Add OAI-specific headers (CRITICAL - required for stealth)
+        self.base_headers['oai-device-id'] = self.fp.get('oai-device-id', str(uuid.uuid4()))
+
         if self.access_token:
-            self.base_url = self.host_url + "/backend-api"
-            self.base_headers['authorization'] = f'Bearer {self.access_token}'
-            if self.account_id:
-                self.base_headers['chatgpt-account-id'] = self.account_id
+            if self.access_token.startswith("session-"):
+                self.base_url = self.host_url + "/backend-api"
+                # Use cookie authentication for session tokens
+                session_token = self.access_token.replace("session-", "")
+                self.base_headers['Cookie'] = f'__Secure-next-auth.session-token={session_token}'
+                # Ensure Authorization header is NOT set or set to something minimal if needed (usually not for cookie auth)
+                if self.account_id:
+                     self.base_headers['chatgpt-account-id'] = self.account_id
+            else:
+                self.base_url = self.host_url + "/backend-api"
+                self.base_headers['authorization'] = f'Bearer {self.access_token}'
+                if self.account_id:
+                    self.base_headers['chatgpt-account-id'] = self.account_id
         else:
             self.base_url = self.host_url + "/backend-anon"
 
@@ -290,6 +312,16 @@ class ChatService:
                 'openai-sentinel-proof-token': self.proof_token,
             }
         )
+        # Add OAI build headers (CRITICAL - forensic analysis 2026-01-30)
+        # These change with each ChatGPT deployment, extracted from HTML
+        from chatgpt.proofofWork import cached_dpl as current_dpl, cached_build_number as current_build
+        if current_dpl:
+            self.chat_headers['oai-client-version'] = current_dpl
+        if current_build:
+            self.chat_headers['oai-client-build-number'] = current_build
+        else:
+            # Fallback to known value from forensic capture 2026-01-30
+            self.chat_headers['oai-client-build-number'] = '4331890'
         if self.ark0se_token:
             self.chat_headers['openai-sentinel-ark' + 'ose-token'] = self.ark0se_token
 
@@ -347,7 +379,8 @@ class ChatService:
 
     async def send_conversation(self):
         try:
-            url = f'{self.base_url}/conversation'
+            # Use new /f/conversation endpoint (critical for stealth - forensic analysis 2026-01-30)
+            url = f'{self.base_url}/f/conversation'
             stream = self.data.get("stream", False)
             r = await self.s.post_stream(url, headers=self.chat_headers, json=self.chat_request, timeout=10, stream=True)
             if r.status_code != 200:

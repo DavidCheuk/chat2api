@@ -19,6 +19,7 @@ timeLayout = "%a %b %d %Y %H:%M:%S"
 cache = dc.Cache('./data/pow_config_cache')
 cached_scripts = []
 cached_dpl = ""
+cached_build_number = ""  # OAI-Client-Build-Number header value
 cached_time = 0
 cached_require_proof = ""
 
@@ -389,7 +390,7 @@ class ScriptSrcParser(HTMLParser):
 
 
 def get_data_build_from_html(html_content):
-    global cached_scripts, cached_dpl, cached_time
+    global cached_scripts, cached_dpl, cached_build_number, cached_time
     parser = ScriptSrcParser()
     parser.feed(html_content)
     if not cached_scripts:
@@ -402,9 +403,24 @@ def get_data_build_from_html(html_content):
             cached_time = int(time.time())
             logger.info(f"Found dpl: {cached_dpl}")
 
+    # Extract build number from _next/static chunks or __NEXT_DATA__
+    # Pattern: /_next/static/chunks/pages/_app-4331890.js or similar
+    if not cached_build_number:
+        build_match = re.search(r'/_next/static/chunks/[^"]*?-(\d{6,8})\.js', html_content)
+        if build_match:
+            cached_build_number = build_match.group(1)
+            logger.info(f"Found build number: {cached_build_number}")
+        else:
+            # Fallback: try to find numeric build in __NEXT_DATA__ buildId
+            next_match = re.search(r'"buildId":"([^"]+)"', html_content)
+            if next_match:
+                # buildId is usually the dpl/client version, not the numeric build
+                # Use a recent known value as fallback
+                cached_build_number = "4331890"  # From forensic capture 2026-01-30
+
 
 async def get_dpl(service):
-    global cached_scripts, cached_dpl, cached_time
+    global cached_scripts, cached_dpl, cached_build_number, cached_time
     if int(time.time()) - cached_time < 15 * 60:
         return True
     headers = service.base_headers.copy()
