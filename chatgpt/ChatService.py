@@ -129,6 +129,10 @@ class ChatService:
         self._turn_trace_id = str(uuid.uuid4())  # H2: UUID per conversation turn
         self._echo_logs = _OaiEchoLogsTracker()  # H3: Cumulative timing pairs
 
+        # Phase 3 stealth: Cookie state (M5, M6)
+        self._oai_sc_counter = 0  # M5: Track oai-sc rotation count
+        self._oai_state_cookies = {}  # M6: OAI state cookies
+
         self.chat_headers = None
         self.chat_request = None
 
@@ -179,6 +183,21 @@ class ChatService:
 
         if auth_key:
             self.base_headers['authkey'] = auth_key
+
+        # M6: Initialize OAI state cookies (normally set by client-side JS)
+        oai_device_id = self.base_headers.get('oai-device-id', str(uuid.uuid4()))
+        self._oai_state_cookies = {
+            'oai-hm': '0',  # Help menu state
+            'oai-hlib': '0',  # Help library state
+            'oai-asli': '0',  # Assistive library state
+        }
+        # Append OAI state cookies to existing Cookie header
+        existing_cookies = self.base_headers.get('Cookie', '')
+        state_cookie_str = '; '.join(f'{k}={v}' for k, v in self._oai_state_cookies.items())
+        if existing_cookies:
+            self.base_headers['Cookie'] = f'{existing_cookies}; {state_cookie_str}'
+        else:
+            self.base_headers['Cookie'] = state_cookie_str
 
         await get_dpl(self)
 
@@ -450,6 +469,12 @@ class ChatService:
             conduit = r.headers.get("x-conduit-token") or r.headers.get("X-Conduit-Token")
             if conduit:
                 self._conduit_token = conduit
+
+            # M5: Track oai-sc cookie rotation from Set-Cookie headers
+            set_cookies = r.headers.get("set-cookie", "")
+            if "oai-sc=" in set_cookies:
+                self._oai_sc_counter += 1
+                logger.debug(f"oai-sc rotated (count: {self._oai_sc_counter})")
 
             # H3: Record turn end timing event
             self._echo_logs.record_event(is_start=False)
