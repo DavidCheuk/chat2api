@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import random
+import time
 import uuid
 
 from fastapi import HTTPException
@@ -30,6 +31,28 @@ from utils.configs import (
     turnstile_solver_url,
     oai_language,
 )
+
+
+class _OaiEchoLogsTracker:
+    """Tracks timing events for Oai-Echo-Logs header (H3).
+
+    Forensic evidence: Cumulative timing pairs sent on conversation POSTs.
+    Format: toggle,ms_offset pairs where toggle=1 for start, 0 for end.
+    """
+
+    def __init__(self):
+        self._session_start = time.time()
+        self._events = []
+
+    def record_event(self, is_start: bool) -> None:
+        offset_ms = int((time.time() - self._session_start) * 1000)
+        toggle = 1 if is_start else 0
+        self._events.append((toggle, offset_ms))
+
+    def get_header_value(self) -> str:
+        if not self._events:
+            return ""
+        return ','.join(f"{t},{ms}" for t, ms in self._events)
 
 
 class ChatService:
@@ -100,6 +123,11 @@ class ChatService:
         self.ark0se_token = None
         self.proof_token = None
         self.turnstile_token = None
+
+        # Phase 2 stealth: Turn tracking and conduit token (H1, H2, H3)
+        self._conduit_token = None  # H1: Extracted from response, echoed in next request
+        self._turn_trace_id = str(uuid.uuid4())  # H2: UUID per conversation turn
+        self._echo_logs = _OaiEchoLogsTracker()  # H3: Cumulative timing pairs
 
         self.chat_headers = None
         self.chat_request = None
@@ -304,6 +332,11 @@ class ChatService:
         except Exception as e:
             logger.error(f"Failed to format messages: {str(e)}")
             raise HTTPException(status_code=400, detail="Failed to format messages.")
+        # H2: New turn trace ID per conversation turn
+        self._turn_trace_id = str(uuid.uuid4())
+        # H3: Record turn start timing event
+        self._echo_logs.record_event(is_start=True)
+
         self.chat_headers = self.base_headers.copy()
         self.chat_headers.update(
             {
@@ -322,6 +355,19 @@ class ChatService:
         else:
             # Fallback to known value from forensic capture 2026-01-30
             self.chat_headers['oai-client-build-number'] = '4331890'
+
+        # H1: Echo conduit token from previous response
+        if self._conduit_token:
+            self.chat_headers['x-conduit-token'] = self._conduit_token
+
+        # H2: Turn trace ID (UUID per conversation turn)
+        self.chat_headers['x-oai-turn-trace-id'] = self._turn_trace_id
+
+        # H3: Echo logs (cumulative timing pairs)
+        echo_value = self._echo_logs.get_header_value()
+        if echo_value:
+            self.chat_headers['oai-echo-logs'] = echo_value
+
         if self.ark0se_token:
             self.chat_headers['openai-sentinel-ark' + 'ose-token'] = self.ark0se_token
 
@@ -399,6 +445,14 @@ class ChatService:
                     detail = r.text[:100]
                 # logger.error(f"Failed to send conversation: {detail}")
                 raise HTTPException(status_code=r.status_code, detail=detail)
+
+            # H1: Extract conduit token from response for next request
+            conduit = r.headers.get("x-conduit-token") or r.headers.get("X-Conduit-Token")
+            if conduit:
+                self._conduit_token = conduit
+
+            # H3: Record turn end timing event
+            self._echo_logs.record_event(is_start=False)
 
             content_type = r.headers.get("Content-Type", "")
             if "text/event-stream" in content_type:
