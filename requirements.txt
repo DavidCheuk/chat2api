@@ -1,6 +1,6 @@
 fastapi==0.115.3
 python-multipart==0.0.13
-curl_cffi==0.7.3
+curl_cffi==0.14.0
 uvicorn
 tiktoken
 python-dotenv

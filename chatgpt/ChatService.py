@@ -148,8 +148,8 @@ class ChatService:
             'sec-fetch-dest': 'empty',
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-origin',
-            # Chrome 144 Client Hints (CRITICAL - all 9 required)
-            'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="124"',
+            # Chrome 136 Client Hints (CRITICAL - all 9 required, must match TLS impersonation)
+            'sec-ch-ua': '"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"macOS"',
             'sec-ch-ua-arch': '""',

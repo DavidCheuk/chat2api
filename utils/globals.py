@@ -22,6 +22,8 @@ fp_map = {}
 seed_map = {}
 conversation_map = {}
 impersonate_list = [
+    "chrome136",
+    "chrome131",
     "chrome124",
     "chrome123",
     "chrome120",
