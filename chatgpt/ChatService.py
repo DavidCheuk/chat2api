@@ -125,7 +125,7 @@ class ChatService:
         self.turnstile_token = None
 
         # Phase 2 stealth: Turn tracking and conduit token (H1, H2, H3)
-        self._conduit_token = None  # H1: Extracted from response, echoed in next request
+        self._conduit_token = 'no-token'  # H1: Initial value per forensic capture
         self._turn_trace_id = str(uuid.uuid4())  # H2: UUID per conversation turn
         self._echo_logs = _OaiEchoLogsTracker()  # H3: Cumulative timing pairs
 
@@ -138,7 +138,7 @@ class ChatService:
 
         self.base_headers = {
             'accept': '*/*',
-            'accept-encoding': 'gzip, deflate, br, zstd',
+            'accept-encoding': 'gzip, deflate, br',
             'accept-language': 'en-US,en;q=0.9',
             'content-type': 'application/json',
             'oai-language': oai_language,
@@ -149,7 +149,7 @@ class ChatService:
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-origin',
             # Chrome 144 Client Hints (CRITICAL - all 9 required)
-            'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="124"',
+            'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"macOS"',
             'sec-ch-ua-arch': '""',
@@ -163,6 +163,15 @@ class ChatService:
 
         # Add OAI-specific headers (CRITICAL - required for stealth)
         self.base_headers['oai-device-id'] = self.fp.get('oai-device-id', str(uuid.uuid4()))
+
+        # SHOULD FIX #6: Add build number/version to base_headers (90% of requests)
+        from chatgpt.proofofWork import cached_dpl as _dpl, cached_build_number as _build
+        if _build:
+            self.base_headers['oai-client-build-number'] = _build
+        else:
+            self.base_headers['oai-client-build-number'] = '4331890'
+        if _dpl:
+            self.base_headers['oai-client-version'] = _dpl
 
         if self.access_token:
             if self.access_token.startswith("session-"):
@@ -185,19 +194,26 @@ class ChatService:
             self.base_headers['authkey'] = auth_key
 
         # M6: Initialize OAI state cookies (normally set by client-side JS)
+        oai_asli_id = str(uuid.uuid4())
         self._oai_state_cookies = {
-            'oai-hm': '0',  # Help menu state
-            'oai-hlib': '0',  # Help library state
-            'oai-asli': '0',  # Assistive library state
+            'oai-hm': 'READY_WHEN_YOU_ARE',  # Home message state
+            'oai-hlib': 'true',  # Help library state
+            'oai-asli': oai_asli_id,  # Assistive library session ID
         }
 
+        # N2: Additional OAI cookies observed in forensic capture
+        self._oai_state_cookies['oai-gn'] = 'User'  # User first name (generic default)
+        model_config = json.dumps({"model": self.data.get("model", "gpt-4o")})
+        self._oai_state_cookies['oai-last-model-config'] = model_config
+
         # L2: g_state cookie (Google ITP optimization)
-        g_state_val = json.dumps({"i_l": 0, "i_t": int(time.time())})
+        g_state_val = json.dumps({"i_l": 0, "i_ll": int(time.time() * 1000), "i_e": {"enable_itp_optimization": 0}})
         self._oai_state_cookies['g_state'] = g_state_val
 
         # L3: _dd_s cookie (DataDog session tracking)
         dd_session_id = uuid.uuid4().hex
-        self._oai_state_cookies['_dd_s'] = f'rum=0&expire={int(time.time()) + 900}&id={dd_session_id}'
+        dd_aid = uuid.uuid4().hex
+        self._oai_state_cookies['_dd_s'] = f'aid={dd_aid}&rum=0&expire={int(time.time() * 1000) + 900000}&logs=1&id={dd_session_id}&created={int(time.time() * 1000)}'
 
         # Append all state cookies to existing Cookie header
         existing_cookies = self.base_headers.get('Cookie', '')
@@ -383,9 +399,8 @@ class ChatService:
             # Fallback to known value from forensic capture 2026-01-30
             self.chat_headers['oai-client-build-number'] = '4331890'
 
-        # H1: Echo conduit token from previous response
-        if self._conduit_token:
-            self.chat_headers['x-conduit-token'] = self._conduit_token
+        # H1: Echo conduit token (initial: 'no-token', then from response)
+        self.chat_headers['x-conduit-token'] = self._conduit_token or 'no-token'
 
         # H2: Turn trace ID (UUID per conversation turn)
         self.chat_headers['x-oai-turn-trace-id'] = self._turn_trace_id
@@ -413,6 +428,10 @@ class ChatService:
         else:
             conversation_mode = {"kind": "primary_assistant"}
 
+        # SHOULD FIX #9: Evolve Referer with conversation_id after first turn (L5)
+        if self.conversation_id:
+            self.chat_headers['referer'] = f'{self.host_url}/c/{self.conversation_id}'
+
         logger.info(f"Model mapping: {self.origin_model} -> {self.req_model}")
         self.chat_request = {
             "action": "next",
@@ -439,10 +458,13 @@ class ChatService:
             "parent_message_id": self.parent_message_id if self.parent_message_id else f"{uuid.uuid4()}",
             "reset_rate_limits": False,
             "suggestions": [],
-            "supported_encodings": [],
+            "supports_buffering": True,
+            "supported_encodings": ["v1"],
+            "enable_message_followups": True,
+            "force_parallel_switch": "auto",
             "system_hints": [],
             "timezone": "America/Los_Angeles",
-            "timezone_offset_min": -480,
+            "timezone_offset_min": 480,
             "variant_purpose": "comparison_implicit",
             "websocket_request_id": f"{uuid.uuid4()}",
         }
@@ -565,7 +587,7 @@ class ChatService:
             r = await self.s.post(
                 url,
                 headers=headers,
-                json={"file_name": file_name, "file_size": file_size, "reset_rate_limits": False, "timezone_offset_min": -480, "use_case": use_case},
+                json={"file_name": file_name, "file_size": file_size, "reset_rate_limits": False, "timezone_offset_min": 480, "use_case": use_case},
                 timeout=5,
             )
             if r.status_code == 200:
