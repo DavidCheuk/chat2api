@@ -19,6 +19,11 @@ moderation_message = "I'm sorry, I cannot provide or engage in any content relat
 
 
 async def format_not_stream_response(response, prompt_tokens, max_tokens, model):
+    """Format SSE stream response into OpenAI non-streaming format.
+
+    P1-49: Updated to handle both old and v1 delta encoding formats via stream_response.
+    The response parameter is already the output of stream_response which handles v1 delta.
+    """
     chat_id = f"chatcmpl-{''.join(random.choice(string.ascii_letters + string.digits) for _ in range(29))}"
     system_fingerprint_list = model_system_fingerprint.get(model, None)
     system_fingerprint = random.choice(system_fingerprint_list) if system_fingerprint_list else None
@@ -31,10 +36,15 @@ async def format_not_stream_response(response, prompt_tokens, max_tokens, model)
             elif not chunk.startswith("data: "):
                 continue
             else:
-                chunk = json.loads(chunk[6:])
-                if not chunk["choices"][0].get("delta"):
+                chunk_data = json.loads(chunk[6:])
+                # P1-49: stream_response already converts to OpenAI format
+                # so we just need to extract the delta content
+                delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                if not delta:
                     continue
-                all_text += chunk["choices"][0]["delta"]["content"]
+                content = delta.get("content", "")
+                if content:
+                    all_text += content
         except Exception as e:
             logger.error(f"Error: {chunk}, error: {str(e)}")
             continue
@@ -113,9 +123,20 @@ async def head_process_response(response):
         chunk = chunk.decode("utf-8")
         if chunk.startswith("data: {"):
             chunk_old_data = json.loads(chunk[6:])
+
+            # Support both old format and v1 delta encoding format
+            # Old format: {"message": {...}, ...}
+            # v1 delta:   {"v": {"message": {...}}, "o": "add", "p": ""}
             message = chunk_old_data.get("message", {})
+            if not message:
+                message = chunk_old_data.get("v", {}).get("message", {}) if isinstance(chunk_old_data.get("v"), dict) else {}
+
             if not message and "error" in chunk_old_data:
                 return response, False
+
+            if not message:
+                continue
+
             role = message.get('author', {}).get('role')
             if role == 'user' or role == 'system':
                 continue
@@ -124,6 +145,30 @@ async def head_process_response(response):
             if status == "in_progress":
                 return response, True
     return response, False
+
+
+def _extract_message_from_chunk(chunk_data: dict) -> dict:
+    """Extract message from chunk, supporting both old format and v1 delta encoding.
+
+    Old format: {"message": {...}, "conversation_id": "..."}
+    v1 delta:   {"v": {"message": {...}}, "o": "add", "p": ""}
+
+    P1-49: Complete v1 delta parser for stealth compliance.
+    Real Chrome supports v1 encoding; disabling it creates fingerprint deviation.
+    """
+    # Try old format first (most common)
+    message = chunk_data.get("message", {})
+    if message:
+        return message
+
+    # Try v1 delta format
+    v_data = chunk_data.get("v")
+    if isinstance(v_data, dict):
+        message = v_data.get("message", {})
+        if message:
+            return message
+
+    return {}
 
 
 async def stream_response(service, response, model, max_tokens):
@@ -169,7 +214,8 @@ async def stream_response(service, response, model, max_tokens):
             if chunk.startswith("data: {"):
                 chunk_old_data = json.loads(chunk[6:])
                 finish_reason = None
-                message = chunk_old_data.get("message", {})
+                # P1-49: Use unified message extractor for v1 delta support
+                message = _extract_message_from_chunk(chunk_old_data)
                 conversation_id = chunk_old_data.get("conversation_id")
                 role = message.get('author', {}).get('role')
                 if role == 'user' or role == 'system':

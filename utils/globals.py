@@ -22,6 +22,7 @@ fp_map = {}
 seed_map = {}
 conversation_map = {}
 impersonate_list = [
+    "chrome144",  # Latest - requires curl_cffi >= 0.15.0
     "chrome136",
     "chrome131",
     "chrome124",

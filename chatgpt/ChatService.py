@@ -1,8 +1,10 @@
 import asyncio
+import base64
 import hashlib
 import json
 import random
 import time
+import urllib.parse
 import uuid
 
 from fastapi import HTTPException
@@ -12,6 +14,7 @@ from api.files import get_image_size, get_file_extension, determine_file_use_cas
 from api.models import model_proxy
 from chatgpt.authorization import get_req_token, verify_token
 from chatgpt.chatFormat import api_messages_to_chat, stream_response, format_not_stream_response, head_process_response
+from chatgpt.stream_v1 import transform_delta_stream
 from chatgpt.chatLimit import check_is_limit, handle_request_limit
 from chatgpt.fp import get_fp
 from chatgpt.proofofWork import get_config, get_dpl, get_answer_token, get_requirements_token, cached_dpl, cached_build_number
@@ -56,6 +59,15 @@ class _OaiEchoLogsTracker:
 
 
 class ChatService:
+    # OAI greeting patterns from forensic capture (~/chatgpt_session Burp 2026-01-30)
+    # Format: "GREETING | READY_WHEN_YOU_ARE" URL-encoded
+    _OAI_HM_PATTERNS = [
+        "AGENDA_TODAY%20%7C%20READY_WHEN_YOU_ARE",
+        "WHAT_ARE_YOU_WORKING_ON%20%7C%20READY_WHEN_YOU_ARE",
+        "WHATS_ON_YOUR_MIND%20%7C%20READY_WHEN_YOU_ARE",
+        "HOW_CAN_I_HELP%20%7C%20READY_WHEN_YOU_ARE",
+    ]
+
     def __init__(self, origin_token=None):
         # self.user_agent = random.choice(user_agents_list) if user_agents_list else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
         self.req_token = get_req_token(origin_token)
@@ -63,6 +75,70 @@ class ChatService:
         self.s = None
         self.ss = None
         self.ws = None
+
+    def _generate_oai_state_cookies(self) -> dict:
+        """Generate OAI state cookies per forensic evidence.
+
+        Forensic source: ~/chatgpt_session (Burp Suite capture 2026-01-30, Chrome 144)
+
+        Returns dict of cookie name -> value
+        """
+        # Get device ID from fingerprint or generate new one
+        device_id = self.fp.get('oai-device-id', str(uuid.uuid4())) if hasattr(self, 'fp') else str(uuid.uuid4())
+
+        # oai-last-model-config: URL-encoded JSON of last used model
+        # Forensic: {"model":"gpt-5-2"} - we use gpt-4o as default
+        model_config = json.dumps({"model": "gpt-4o"})
+        model_config_encoded = urllib.parse.quote(model_config, safe='')
+
+        # oai-client-auth-info: URL-encoded JSON with user info
+        # Forensic shows: {"user":{"name":"...","email":"...","picture":"...","connectionType":2,"timestamp":...},"loggedInWithGoogleOneTap":false,"isOptedOut":false}
+        auth_info = json.dumps({
+            "user": {
+                "name": "User",
+                "email": "user@example.com",
+                "picture": "https://cdn.auth0.com/avatars/us.png",
+                "connectionType": 2,
+                "timestamp": int(time.time() * 1000)
+            },
+            "loggedInWithGoogleOneTap": False,
+            "isOptedOut": False
+        })
+        auth_info_encoded = urllib.parse.quote(auth_info, safe='')
+
+        # _puid: User ID with timestamp and signature
+        # Forensic format: user-{user_id}:{timestamp}-{base64_signature}
+        # We generate a plausible signature using hash of device_id + timestamp
+        puid_timestamp = int(time.time())
+        puid_sig_input = f"{device_id}{puid_timestamp}".encode()
+        puid_sig = hashlib.sha256(puid_sig_input).digest()
+        puid_sig_b64 = base64.b64encode(puid_sig).decode().rstrip('=')
+        puid_value = f"user-{device_id[:20]}:{puid_timestamp}-{puid_sig_b64}"
+
+        return {
+            'oai-did': device_id,  # Device ID (also sent as header)
+            'oai-hm': random.choice(self._OAI_HM_PATTERNS),  # Already URL-encoded
+            'oai-hlib': 'true',  # Boolean as string
+            'oai-asli': str(uuid.uuid4()),  # Session UUID
+            'oai-gn': 'User',  # First name (forensic showed "David")
+            'oai-last-model-config': model_config_encoded,  # Last used model
+            'oai-client-auth-info': auth_info_encoded,  # User profile info
+            '_puid': urllib.parse.quote(puid_value, safe=''),  # User ID signature
+        }
+
+    def _build_cookie_header(self, existing_cookie: str = None) -> str:
+        """Build Cookie header with OAI state cookies.
+
+        Combines existing cookies (like session token) with OAI state cookies.
+        """
+        parts = []
+        if existing_cookie:
+            parts.append(existing_cookie)
+
+        for name, value in self._oai_state_cookies.items():
+            parts.append(f"{name}={value}")
+
+        return '; '.join(parts)
 
     async def set_dynamic_data(self, data):
         if self.req_token:
@@ -131,13 +207,18 @@ class ChatService:
 
         # Phase 3 stealth: Cookie state (M5, M6)
         self._oai_sc_counter = 0  # M5: Track oai-sc rotation count
-        self._oai_state_cookies = {}  # M6: OAI state cookies
+        # M6: OAI state cookies - Forensic evidence from ~/chatgpt_session (Burp 2026-01-30)
+        # Real Chrome 144 sends these cookies on every request
+        self._oai_state_cookies = self._generate_oai_state_cookies()
 
         self.chat_headers = None
         self.chat_request = None
 
         self.base_headers = {
             'accept': '*/*',
+            # P1-51: Accept-Encoding must match real Chrome browser
+            # Forensic evidence (~/chatgpt_session Burp capture 2026-01-30):
+            # Real Chrome 144 sends: "gzip, deflate, br" (NO zstd)
             'accept-encoding': 'gzip, deflate, br',
             'accept-language': 'en-US,en;q=0.9',
             'content-type': 'application/json',
@@ -148,8 +229,15 @@ class ChatService:
             'sec-fetch-dest': 'empty',
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-origin',
-            # Chrome 136 Client Hints (CRITICAL - all 9 required, must match TLS impersonation)
-            'sec-ch-ua': '"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"',
+        }
+        # Apply fp first (may contain ua_generator sec-ch-ua values)
+        self.base_headers.update(self.fp)
+        # Then OVERRIDE with Chrome 144 Client Hints (CRITICAL - must match TLS impersonation)
+        # Forensic source: ~/chatgpt_session Burp capture 2026-01-30
+        # fp.update() above may set sec-ch-ua from ua_generator with wrong Chrome version
+        # These MUST come AFTER fp update to ensure cross-layer consistency
+        self.base_headers.update({
+            'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"macOS"',
             'sec-ch-ua-arch': '""',
@@ -158,8 +246,7 @@ class ChatService:
             'sec-ch-ua-full-version-list': '',
             'sec-ch-ua-model': '""',
             'sec-ch-ua-platform-version': '""',
-        }
-        self.base_headers.update(self.fp)
+        })
 
         # Add OAI-specific headers (CRITICAL - required for stealth)
         self.base_headers['oai-device-id'] = self.fp.get('oai-device-id', str(uuid.uuid4()))
@@ -178,50 +265,26 @@ class ChatService:
                 self.base_url = self.host_url + "/backend-api"
                 # Use cookie authentication for session tokens
                 session_token = self.access_token.replace("session-", "")
-                self.base_headers['Cookie'] = f'__Secure-next-auth.session-token={session_token}'
+                session_cookie = f'__Secure-next-auth.session-token={session_token}'
+                # Include OAI state cookies (oai-hm, oai-hlib, oai-asli) per forensic evidence
+                self.base_headers['Cookie'] = self._build_cookie_header(session_cookie)
                 # Ensure Authorization header is NOT set or set to something minimal if needed (usually not for cookie auth)
                 if self.account_id:
                      self.base_headers['chatgpt-account-id'] = self.account_id
             else:
                 self.base_url = self.host_url + "/backend-api"
                 self.base_headers['authorization'] = f'Bearer {self.access_token}'
+                # Include OAI state cookies even with Bearer auth (browser sends both)
+                self.base_headers['Cookie'] = self._build_cookie_header()
                 if self.account_id:
                     self.base_headers['chatgpt-account-id'] = self.account_id
         else:
             self.base_url = self.host_url + "/backend-anon"
+            # Include OAI state cookies for anonymous mode too
+            self.base_headers['Cookie'] = self._build_cookie_header()
 
         if auth_key:
             self.base_headers['authkey'] = auth_key
-
-        # M6: Initialize OAI state cookies (normally set by client-side JS)
-        oai_asli_id = str(uuid.uuid4())
-        self._oai_state_cookies = {
-            'oai-hm': 'READY_WHEN_YOU_ARE',  # Home message state
-            'oai-hlib': 'true',  # Help library state
-            'oai-asli': oai_asli_id,  # Assistive library session ID
-        }
-
-        # N2: Additional OAI cookies observed in forensic capture
-        self._oai_state_cookies['oai-gn'] = 'User'  # User first name (generic default)
-        model_config = json.dumps({"model": self.data.get("model", "gpt-4o")})
-        self._oai_state_cookies['oai-last-model-config'] = model_config
-
-        # L2: g_state cookie (Google ITP optimization)
-        g_state_val = json.dumps({"i_l": 0, "i_ll": int(time.time() * 1000), "i_e": {"enable_itp_optimization": 0}})
-        self._oai_state_cookies['g_state'] = g_state_val
-
-        # L3: _dd_s cookie (DataDog session tracking)
-        dd_session_id = uuid.uuid4().hex
-        dd_aid = uuid.uuid4().hex
-        self._oai_state_cookies['_dd_s'] = f'aid={dd_aid}&rum=0&expire={int(time.time() * 1000) + 900000}&logs=1&id={dd_session_id}&created={int(time.time() * 1000)}'
-
-        # Append all state cookies to existing Cookie header
-        existing_cookies = self.base_headers.get('Cookie', '')
-        state_cookie_str = '; '.join(f'{k}={v}' for k, v in self._oai_state_cookies.items())
-        if existing_cookies:
-            self.base_headers['Cookie'] = f'{existing_cookies}; {state_cookie_str}'
-        else:
-            self.base_headers['Cookie'] = state_cookie_str
 
         await get_dpl(self)
 
@@ -279,7 +342,7 @@ class ChatService:
             config = get_config(self.user_agent, self.req_token)
             p = get_requirements_token(config)
             data = {'p': p}
-            r = await self.ss.post(url, headers=headers, json=data, timeout=5)
+            r = await self.ss.post(url, headers=headers, json=data, timeout=10)
             if r.status_code == 200:
                 resp = r.json()
 
@@ -459,6 +522,8 @@ class ChatService:
             "reset_rate_limits": False,
             "suggestions": [],
             "supports_buffering": True,
+            # P1-49: v1 delta encoding ENABLED for stealth compliance
+            # Real Chrome supports v1; stream_v1.py transforms v1 delta -> old format
             "supported_encodings": ["v1"],
             "enable_message_followups": True,
             "force_parallel_switch": "auto",
@@ -472,12 +537,65 @@ class ChatService:
             self.chat_request['conversation_id'] = self.conversation_id
         return self.chat_request
 
+    def _filter_cookies_for_conversation(self) -> dict:
+        """P1-50: Filter cookies for conversation POST - pass session cookies, skip sentinel-specific ones.
+
+        Real browsers send 19 cookies on conversation POST. Empty cookie jar (cookies={}) is
+        instant bot detection signal. This method filters the accumulated session cookies,
+        excluding only sentinel-specific temporary cookies that shouldn't be forwarded.
+
+        Stealth Impact: +25 points (removes empty cookie jar detection signal)
+        """
+        # Get cookies from the session - handle both CookieJar and dict formats
+        session_cookies = {}
+        if self.s and hasattr(self.s, 'session') and self.s.session:
+            try:
+                cookies = self.s.session.cookies
+                if hasattr(cookies, 'items'):
+                    # Dict-like or CookieJar with items()
+                    for name, value in cookies.items():
+                        if hasattr(value, 'value'):
+                            session_cookies[name] = value.value
+                        else:
+                            session_cookies[name] = str(value)
+                elif hasattr(cookies, '__iter__'):
+                    # Iterable of Cookie objects
+                    for cookie in cookies:
+                        if hasattr(cookie, 'name') and hasattr(cookie, 'value'):
+                            session_cookies[cookie.name] = cookie.value
+                        elif isinstance(cookie, str):
+                            # Skip string cookies
+                            continue
+            except Exception as e:
+                logger.debug(f"Cookie extraction error: {e}")
+
+        # Cookies to exclude (sentinel-specific, should not be forwarded to conversation)
+        exclude_cookies = {
+            '_sentinel_prepare',  # Sentinel prepare state
+            '_pow_temp',          # Proof of work temporary
+            '_turnstile_temp',    # Turnstile temporary
+        }
+
+        # Filter and return
+        filtered = {k: v for k, v in session_cookies.items() if k not in exclude_cookies}
+
+        # Log for debugging
+        if filtered:
+            logger.debug(f"Forwarding {len(filtered)} cookies to conversation (filtered from {len(session_cookies)})")
+        else:
+            logger.debug("No session cookies to forward (using session's default)")
+
+        return filtered if filtered else None  # None = use session's cookies
+
     async def send_conversation(self):
         try:
             # Use new /f/conversation endpoint (critical for stealth - forensic analysis 2026-01-30)
             url = f'{self.base_url}/f/conversation'
             stream = self.data.get("stream", False)
-            r = await self.s.post_stream(url, headers=self.chat_headers, json=self.chat_request, timeout=10, stream=True)
+            # P1-50: Filter cookies instead of sending empty dict
+            # Real browsers send 19 cookies; empty jar is bot detection signal
+            filtered_cookies = self._filter_cookies_for_conversation()
+            r = await self.s.post_stream(url, headers=self.chat_headers, cookies=filtered_cookies, json=self.chat_request, timeout=10, stream=True)
             if r.status_code != 200:
                 rtext = await r.atext()
                 if "application/json" == r.headers.get("Content-Type", ""):
@@ -511,7 +629,9 @@ class ChatService:
 
             content_type = r.headers.get("Content-Type", "")
             if "text/event-stream" in content_type:
-                res, start = await head_process_response(r.aiter_lines())
+                # P1-49: v1 delta middleware converts v1 delta -> old format before parsing
+                normalized_stream = transform_delta_stream(r.aiter_lines())
+                res, start = await head_process_response(normalized_stream)
                 if not start:
                     raise HTTPException(
                         status_code=403,
